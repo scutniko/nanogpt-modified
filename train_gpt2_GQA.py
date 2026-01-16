@@ -19,52 +19,63 @@ class CausalSelfAttention(nn.Module):
     def __init__(self, config):
         super().__init__()
         assert config.n_embd % config.n_head == 0
-        # 在一个batch中，对全部的head进行query, key, value投影
+        # GQA: Grouped Query Attention
+        # Q 有 n_head 个头，K 和 V 有 n_kv_head 个头 (n_kv_head < n_head)
+        # 多个 Q 头共享一个 KV 头，减少 KV cache 大小
         # B: batch size
         # T: sequence length
         # C: embedding dimension
 
-        # [B, T, C] -> [B, T, 3 * C]
-        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd)
-        
-        # [B, T, 3 * C] -> [B, T, C]
-        self.c_proj = nn.Linear(config.n_embd, config.n_embd)
-        self.c_proj.NANOGPT_SCALE_INIT = 1
-        # n_head: number of heads
-        # n_embd: embedding dimension
         self.n_head = config.n_head
+        self.n_kv_head = config.n_kv_head  # KV 头的数量
         self.n_embd = config.n_embd
+        self.head_dim = config.n_embd // config.n_head
+        
+        # 计算每个 KV 头对应多少个 Q 头
+        assert config.n_head % config.n_kv_head == 0, "n_head must be divisible by n_kv_head"
+        self.n_rep = config.n_head // config.n_kv_head
+        
+        # Q 投影: [B, T, C] -> [B, T, C]
+        self.q_proj = nn.Linear(config.n_embd, config.n_embd, bias=False)
+        # K, V 投影: [B, T, C] -> [B, T, n_kv_head * head_dim]
+        self.k_proj = nn.Linear(config.n_embd, config.n_kv_head * self.head_dim, bias=False)
+        self.v_proj = nn.Linear(config.n_embd, config.n_kv_head * self.head_dim, bias=False)
+        
+        # 输出投影: [B, T, C] -> [B, T, C]
+        self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=False)
+        self.c_proj.NANOGPT_SCALE_INIT = 1
 
     def forward(self, x):
         # 输入x的shape是[B, T, C]，最终输出y的shape是[B, T, C]
-        # C是n_head * head_size
-        # GPT-2 (124M), n_head=12, head_size=64, 所以 n_head * head_size=C=768 即Transformer的通道数
         B, T, C = x.size() 
         
-        # 对输入x进行线性变换，得到[B, T, 3 * C]
-        qkv = self.c_attn(x)
+        # Q 投影: [B, T, C] -> [B, T, n_head, head_dim] -> [B, n_head, T, head_dim]
+        q = self.q_proj(x)
+        q = q.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
+        
+        # K, V 投影: [B, T, C] -> [B, T, n_kv_head, head_dim] -> [B, n_kv_head, T, head_dim]
+        k = self.k_proj(x)
+        k = k.view(B, T, self.n_kv_head, self.head_dim).transpose(1, 2)
+        
+        v = self.v_proj(x)
+        v = v.view(B, T, self.n_kv_head, self.head_dim).transpose(1, 2)
+        
+        # 重复 K 和 V 来匹配 Q 的头数
+        # [B, n_kv_head, T, head_dim] -> [B, n_head, T, head_dim]
+        if self.n_rep > 1:
+            # 每个 KV 头重复 n_rep 次
+            k = k.repeat_interleave(self.n_rep, dim=1)
+            v = v.repeat_interleave(self.n_rep, dim=1)
 
-        # [B, T, 3 * C] -> [B, T, C], [B, T, C], [B, T, C]
-        # 将[B, T, 3 * C]沿着第2维（feature维）按照每份n_embd的大小分成3份，也就是q、k、v三个张量。
-        q, k, v = qkv.split(self.n_embd, dim=2)
+        # 使用 flash attention 计算注意力
+        # [B, n_head, T, head_dim] -> [B, n_head, T, head_dim]
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
 
-        # 将qkv分别转换为[B, T, n_head, head_size]的形状，再转置得到[B, n_head, T, head_size]
-        # 之所以要转置，是会把batch与时间步维度放到前面，方便后续的计算。
-        # [B, T, C] -> [B, n_head, T, head_size]
-        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
-        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
-        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
+        # 将多头输出拼接回原始维度
+        # [B, n_head, T, head_dim] -> [B, T, n_head, head_dim] -> [B, T, C]
+        y = y.transpose(1, 2).contiguous().view(B, T, C)
 
-        # 使用flash attention计算注意力，得到[B, n_head, T, head_size]
-        # is_causal=True表示是因果注意力，即只能看到前面的token，不能看到后面的token。
-        # 返回的y的shape是[B, n_head, T, head_size]
-        y = F.scaled_dot_product_attention(q, k, v, is_causal=True) # flash attention
-
-        # 将[B, n_head, T, head_size]转置回[B, T, C]，再拼接起来
-        # 其中contiguous()是为了确保tensor在内存中是连续的，因为transpose会破坏连续性，所以需要重新排列内存，方便后续的计算。
-        y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
-
-        # 对输出y进行线性变换，shape不变，还是[B, T, C]
+        # 输出投影
         y = self.c_proj(y)
         return y
 
@@ -118,7 +129,8 @@ class GPTConfig:
     block_size: int = 1024 # max sequence length
     vocab_size: int = 50257 # number of tokens: 50,000 BPE merges + 256 bytes tokens + 1 <|endoftext|> token
     n_layer: int = 12 # number of layers
-    n_head: int = 12 # number of heads
+    n_head: int = 12 # number of heads (for Q)
+    n_kv_head: int = 4 # number of KV heads for GQA (每3个Q头共享1个KV头)
     n_embd: int = 768 # embedding dimension
 
 class GPT(nn.Module):
@@ -206,10 +218,10 @@ class GPT(nn.Module):
 
         # n_layer, n_head and n_embd are determined from model_type
         config_args = {
-            'gpt2':         dict(n_layer=12, n_head=12, n_embd=768),  # 124M params
-            'gpt2-medium':  dict(n_layer=24, n_head=16, n_embd=1024), # 350M params
-            'gpt2-large':   dict(n_layer=36, n_head=20, n_embd=1280), # 774M params
-            'gpt2-xl':      dict(n_layer=48, n_head=25, n_embd=1600), # 1558M params
+            'gpt2':         dict(n_layer=12, n_head=12, n_kv_head=4, n_embd=768),  # 124M params, GQA 4 KV heads
+            'gpt2-medium':  dict(n_layer=24, n_head=16, n_kv_head=4, n_embd=1024), # 350M params, GQA 4 KV heads
+            'gpt2-large':   dict(n_layer=36, n_head=20, n_kv_head=4, n_embd=1280), # 774M params, GQA 4 KV heads
+            'gpt2-xl':      dict(n_layer=48, n_head=25, n_kv_head=5, n_embd=1600), # 1558M params, GQA 5 KV heads
         }[model_type]
         config_args['vocab_size'] = 50257 # always 50257 for GPT model checkpoints
         config_args['block_size'] = 1024 # always 1024 for GPT model checkpoints
@@ -441,9 +453,10 @@ def main():
 
     torch.set_float32_matmul_precision('high')
 
-    # create model
-    model = GPT(GPTConfig(vocab_size=50304))
-    # model = GPT.from_pretrained("gpt2") # or init from OpenAI GPT-2
+    # create model with GQA
+    # vocab_size=50304 for better GPU alignment (divisible by 128)
+    model = GPT(GPTConfig(vocab_size=50304, n_kv_head=4))
+    # model = GPT.from_pretrained("gpt2") # or init from OpenAI GPT-2 (需要重新训练，预训练权重不支持GQA)
 
     # 检查点恢复（在DDP包装之前）
     parser = argparse.ArgumentParser()
@@ -530,7 +543,7 @@ def main():
             print(f"✓ 恢复优化器状态")
 
     # create the log directory we will write checkpoints to and log to
-    log_dir = "/opt/train/data/nanogpt/baseline/log"
+    log_dir = "/opt/train/data/nanogpt/GQA/log"
     os.makedirs(log_dir, exist_ok=True)
     log_file = os.path.join(log_dir, f"log.txt")
     # 只有在非恢复模式下才清空日志文件，恢复训练时保留之前的日志

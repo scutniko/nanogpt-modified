@@ -19,52 +19,75 @@ class CausalSelfAttention(nn.Module):
     def __init__(self, config):
         super().__init__()
         assert config.n_embd % config.n_head == 0
-        # 在一个batch中，对全部的head进行query, key, value投影
-        # B: batch size
-        # T: sequence length
-        # C: embedding dimension
-
-        # [B, T, C] -> [B, T, 3 * C]
-        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd)
+        # MLA: Multi-head Latent Attention (DeepSeek-V2)
+        # 通过低秩压缩大幅减少 KV cache，同时保持模型性能
+        # 核心思想：将 KV 投影到低维潜在空间，减少存储和计算开销
         
-        # [B, T, 3 * C] -> [B, T, C]
-        self.c_proj = nn.Linear(config.n_embd, config.n_embd)
-        self.c_proj.NANOGPT_SCALE_INIT = 1
-        # n_head: number of heads
-        # n_embd: embedding dimension
         self.n_head = config.n_head
         self.n_embd = config.n_embd
+        self.head_dim = config.n_embd // config.n_head
+        
+        # MLA 的关键参数：潜在维度（低维压缩空间）
+        # 通常设置为 n_embd 的 1/4 到 1/2，这里使用 1/4 以获得更好的压缩比
+        self.kv_lora_rank = config.kv_lora_rank  # KV 低秩维度
+        self.q_lora_rank = config.q_lora_rank    # Q 低秩维度
+        
+        # === MLA 的三阶段投影 ===
+        
+        # 阶段1: 压缩投影 - 将输入压缩到低维潜在空间
+        # [B, T, C] -> [B, T, kv_lora_rank + q_lora_rank]
+        self.down_proj = nn.Linear(config.n_embd, self.kv_lora_rank + self.q_lora_rank, bias=False)
+        
+        # 阶段2: KV 解压投影 - 从低维潜在空间解压到多头 KV 空间
+        # [B, T, kv_lora_rank] -> [B, T, 2 * n_embd]
+        self.kv_up_proj = nn.Linear(self.kv_lora_rank, 2 * config.n_embd, bias=False)
+        
+        # 阶段3: Q 解压投影 - 从低维潜在空间解压到多头 Q 空间
+        # [B, T, q_lora_rank] -> [B, T, n_embd]
+        self.q_up_proj = nn.Linear(self.q_lora_rank, config.n_embd, bias=False)
+        
+        # 输出投影
+        self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=False)
+        self.c_proj.NANOGPT_SCALE_INIT = 1
 
     def forward(self, x):
         # 输入x的shape是[B, T, C]，最终输出y的shape是[B, T, C]
-        # C是n_head * head_size
-        # GPT-2 (124M), n_head=12, head_size=64, 所以 n_head * head_size=C=768 即Transformer的通道数
-        B, T, C = x.size() 
+        B, T, C = x.size()
         
-        # 对输入x进行线性变换，得到[B, T, 3 * C]
-        qkv = self.c_attn(x)
-
-        # [B, T, 3 * C] -> [B, T, C], [B, T, C], [B, T, C]
-        # 将[B, T, 3 * C]沿着第2维（feature维）按照每份n_embd的大小分成3份，也就是q、k、v三个张量。
-        q, k, v = qkv.split(self.n_embd, dim=2)
-
-        # 将qkv分别转换为[B, T, n_head, head_size]的形状，再转置得到[B, n_head, T, head_size]
-        # 之所以要转置，是会把batch与时间步维度放到前面，方便后续的计算。
-        # [B, T, C] -> [B, n_head, T, head_size]
-        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
-        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
-        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
-
-        # 使用flash attention计算注意力，得到[B, n_head, T, head_size]
-        # is_causal=True表示是因果注意力，即只能看到前面的token，不能看到后面的token。
-        # 返回的y的shape是[B, n_head, T, head_size]
-        y = F.scaled_dot_product_attention(q, k, v, is_causal=True) # flash attention
-
-        # 将[B, n_head, T, head_size]转置回[B, T, C]，再拼接起来
-        # 其中contiguous()是为了确保tensor在内存中是连续的，因为transpose会破坏连续性，所以需要重新排列内存，方便后续的计算。
-        y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
-
-        # 对输出y进行线性变换，shape不变，还是[B, T, C]
+        # === MLA 前向传播 ===
+        
+        # 步骤1: 压缩到低维潜在空间
+        # [B, T, C] -> [B, T, kv_lora_rank + q_lora_rank]
+        latent = self.down_proj(x)
+        
+        # 分离 KV 和 Q 的潜在表示
+        kv_latent = latent[:, :, :self.kv_lora_rank]  # [B, T, kv_lora_rank]
+        q_latent = latent[:, :, self.kv_lora_rank:]   # [B, T, q_lora_rank]
+        
+        # 步骤2: 从潜在空间解压 KV
+        # [B, T, kv_lora_rank] -> [B, T, 2 * C]
+        kv = self.kv_up_proj(kv_latent)
+        k, v = kv.split(self.n_embd, dim=2)  # 分离 K 和 V，各为 [B, T, C]
+        
+        # 步骤3: 从潜在空间解压 Q
+        # [B, T, q_lora_rank] -> [B, T, C]
+        q = self.q_up_proj(q_latent)
+        
+        # 步骤4: 重塑为多头格式
+        # [B, T, C] -> [B, n_head, T, head_dim]
+        q = q.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
+        k = k.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
+        v = v.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
+        
+        # 步骤5: 标准的多头注意力计算
+        # [B, n_head, T, head_dim] -> [B, n_head, T, head_dim]
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        
+        # 步骤6: 合并多头输出
+        # [B, n_head, T, head_dim] -> [B, T, C]
+        y = y.transpose(1, 2).contiguous().view(B, T, C)
+        
+        # 步骤7: 输出投影
         y = self.c_proj(y)
         return y
 
@@ -120,6 +143,9 @@ class GPTConfig:
     n_layer: int = 12 # number of layers
     n_head: int = 12 # number of heads
     n_embd: int = 768 # embedding dimension
+    # MLA 参数：低秩压缩维度
+    kv_lora_rank: int = 192 # KV 潜在维度 (n_embd / 4，压缩比 4:1)
+    q_lora_rank: int = 384   # Q 潜在维度 (n_embd / 2，压缩比 2:1)
 
 class GPT(nn.Module):
     
@@ -206,10 +232,10 @@ class GPT(nn.Module):
 
         # n_layer, n_head and n_embd are determined from model_type
         config_args = {
-            'gpt2':         dict(n_layer=12, n_head=12, n_embd=768),  # 124M params
-            'gpt2-medium':  dict(n_layer=24, n_head=16, n_embd=1024), # 350M params
-            'gpt2-large':   dict(n_layer=36, n_head=20, n_embd=1280), # 774M params
-            'gpt2-xl':      dict(n_layer=48, n_head=25, n_embd=1600), # 1558M params
+            'gpt2':         dict(n_layer=12, n_head=12, n_embd=768, kv_lora_rank=192, q_lora_rank=384),  # 124M params, MLA
+            'gpt2-medium':  dict(n_layer=24, n_head=16, n_embd=1024, kv_lora_rank=256, q_lora_rank=512), # 350M params, MLA
+            'gpt2-large':   dict(n_layer=36, n_head=20, n_embd=1280, kv_lora_rank=320, q_lora_rank=640), # 774M params, MLA
+            'gpt2-xl':      dict(n_layer=48, n_head=25, n_embd=1600, kv_lora_rank=400, q_lora_rank=800), # 1558M params, MLA
         }[model_type]
         config_args['vocab_size'] = 50257 # always 50257 for GPT model checkpoints
         config_args['block_size'] = 1024 # always 1024 for GPT model checkpoints
@@ -441,9 +467,11 @@ def main():
 
     torch.set_float32_matmul_precision('high')
 
-    # create model
-    model = GPT(GPTConfig(vocab_size=50304))
-    # model = GPT.from_pretrained("gpt2") # or init from OpenAI GPT-2
+    # create model with MLA
+    # vocab_size=50304 for better GPU alignment (divisible by 128)
+    # MLA: kv_lora_rank=192 (1/4 compression), q_lora_rank=384 (1/2 compression)
+    model = GPT(GPTConfig(vocab_size=50304, kv_lora_rank=192, q_lora_rank=384))
+    # model = GPT.from_pretrained("gpt2") # or init from OpenAI GPT-2 (需要重新训练，预训练权重不支持MLA)
 
     # 检查点恢复（在DDP包装之前）
     parser = argparse.ArgumentParser()
@@ -530,7 +558,7 @@ def main():
             print(f"✓ 恢复优化器状态")
 
     # create the log directory we will write checkpoints to and log to
-    log_dir = "/opt/train/data/nanogpt/baseline/log"
+    log_dir = "/opt/train/data/nanogpt/MLA/log"
     os.makedirs(log_dir, exist_ok=True)
     log_file = os.path.join(log_dir, f"log.txt")
     # 只有在非恢复模式下才清空日志文件，恢复训练时保留之前的日志

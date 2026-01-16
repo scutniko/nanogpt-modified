@@ -564,7 +564,7 @@ def main():
             print(f"✓ 恢复优化器状态")
 
     # create the log directory we will write checkpoints to and log to
-    log_dir = "log"
+    log_dir = "/opt/train/data/nanogpt/sine/log"
     os.makedirs(log_dir, exist_ok=True)
     log_file = os.path.join(log_dir, f"log.txt")
     # 只有在非恢复模式下才清空日志文件，恢复训练时保留之前的日志
