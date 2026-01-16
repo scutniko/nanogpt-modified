@@ -192,54 +192,54 @@ class GPT(nn.Module):
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
         return logits, loss
 
-    @classmethod
-    def from_pretrained(cls, model_type):
-        """Loads pretrained GPT-2 model weights from huggingface"""
-        assert model_type in {'gpt2', 'gpt2-medium', 'gpt2-large', 'gpt2-xl'}
-        from transformers import GPT2LMHeadModel
-        print("loading weights from pretrained gpt: %s" % model_type)
+    # @classmethod
+    # def from_pretrained(cls, model_type):
+    #     """Loads pretrained GPT-2 model weights from huggingface"""
+    #     assert model_type in {'gpt2', 'gpt2-medium', 'gpt2-large', 'gpt2-xl'}
+    #     from transformers import GPT2LMHeadModel
+    #     print("loading weights from pretrained gpt: %s" % model_type)
 
-        # n_layer, n_head and n_embd are determined from model_type
-        config_args = {
-            'gpt2':         dict(n_layer=12, n_head=12, n_embd=768),  # 124M params
-            'gpt2-medium':  dict(n_layer=24, n_head=16, n_embd=1024), # 350M params
-            'gpt2-large':   dict(n_layer=36, n_head=20, n_embd=1280), # 774M params
-            'gpt2-xl':      dict(n_layer=48, n_head=25, n_embd=1600), # 1558M params
-        }[model_type]
-        config_args['vocab_size'] = 50257 # always 50257 for GPT model checkpoints
-        config_args['block_size'] = 1024 # always 1024 for GPT model checkpoints
-        # create a from-scratch initialized minGPT model
-        config = GPTConfig(**config_args)
-        model = GPT(config)
-        sd = model.state_dict()
-        sd_keys = sd.keys()
-        sd_keys = [k for k in sd_keys if not k.endswith('.attn.bias')] # discard this mask / buffer, not a param
+    #     # n_layer, n_head and n_embd are determined from model_type
+    #     config_args = {
+    #         'gpt2':         dict(n_layer=12, n_head=12, n_embd=768),  # 124M params
+    #         'gpt2-medium':  dict(n_layer=24, n_head=16, n_embd=1024), # 350M params
+    #         'gpt2-large':   dict(n_layer=36, n_head=20, n_embd=1280), # 774M params
+    #         'gpt2-xl':      dict(n_layer=48, n_head=25, n_embd=1600), # 1558M params
+    #     }[model_type]
+    #     config_args['vocab_size'] = 50257 # always 50257 for GPT model checkpoints
+    #     config_args['block_size'] = 1024 # always 1024 for GPT model checkpoints
+    #     # create a from-scratch initialized minGPT model
+    #     config = GPTConfig(**config_args)
+    #     model = GPT(config)
+    #     sd = model.state_dict()
+    #     sd_keys = sd.keys()
+    #     sd_keys = [k for k in sd_keys if not k.endswith('.attn.bias')] # discard this mask / buffer, not a param
 
-        # init a huggingface/transformers model
-        model_hf = GPT2LMHeadModel.from_pretrained(model_type)
-        sd_hf = model_hf.state_dict()
+    #     # init a huggingface/transformers model
+    #     model_hf = GPT2LMHeadModel.from_pretrained(model_type)
+    #     sd_hf = model_hf.state_dict()
 
-        # copy while ensuring all of the parameters are aligned and match in names and shapes
-        sd_keys_hf = sd_hf.keys()
-        sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.masked_bias')] # ignore these, just a buffer
-        sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.bias')] # same, just the mask (buffer)
-        transposed = ['attn.c_attn.weight', 'attn.c_proj.weight', 'mlp.c_fc.weight', 'mlp.c_proj.weight']
-        # basically the openai checkpoints use a "Conv1D" module, but we only want to use a vanilla Linear
-        # this means that we have to transpose these weights when we import them
-        assert len(sd_keys_hf) == len(sd_keys), f"mismatched keys: {len(sd_keys_hf)} != {len(sd_keys)}"
-        for k in sd_keys_hf:
-            if any(k.endswith(w) for w in transposed):
-                # special treatment for the Conv1D weights we need to transpose
-                assert sd_hf[k].shape[::-1] == sd[k].shape
-                with torch.no_grad():
-                    sd[k].copy_(sd_hf[k].t())
-            else:
-                # vanilla copy over the other parameters
-                assert sd_hf[k].shape == sd[k].shape
-                with torch.no_grad():
-                    sd[k].copy_(sd_hf[k])
+    #     # copy while ensuring all of the parameters are aligned and match in names and shapes
+    #     sd_keys_hf = sd_hf.keys()
+    #     sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.masked_bias')] # ignore these, just a buffer
+    #     sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.bias')] # same, just the mask (buffer)
+    #     transposed = ['attn.c_attn.weight', 'attn.c_proj.weight', 'mlp.c_fc.weight', 'mlp.c_proj.weight']
+    #     # basically the openai checkpoints use a "Conv1D" module, but we only want to use a vanilla Linear
+    #     # this means that we have to transpose these weights when we import them
+    #     assert len(sd_keys_hf) == len(sd_keys), f"mismatched keys: {len(sd_keys_hf)} != {len(sd_keys)}"
+    #     for k in sd_keys_hf:
+    #         if any(k.endswith(w) for w in transposed):
+    #             # special treatment for the Conv1D weights we need to transpose
+    #             assert sd_hf[k].shape[::-1] == sd[k].shape
+    #             with torch.no_grad():
+    #                 sd[k].copy_(sd_hf[k].t())
+    #         else:
+    #             # vanilla copy over the other parameters
+    #             assert sd_hf[k].shape == sd[k].shape
+    #             with torch.no_grad():
+    #                 sd[k].copy_(sd_hf[k])
 
-        return model
+    #     return model
 
     def configure_optimizers(self, weight_decay, learning_rate, device_type):
         # 获取所有需要梯度更新的参数
@@ -432,10 +432,12 @@ parser.add_argument("--inference", type=str, default=None, help="Inference mode:
 args = parser.parse_args()
 
 start_step = 0
+resume_checkpoint = None  # 保存检查点数据，用于后续恢复优化器和数据加载器状态
 if args.resume:
     ckpt = torch.load(args.resume, map_location=device, weights_only=False)
     model.load_state_dict(ckpt['model'])
     start_step = ckpt['step'] + 1
+    resume_checkpoint = ckpt  # 保存检查点，后续使用
     if master_process:
         print(f"✓ 从 {args.resume} 恢复训练 (第 {start_step} 步开始)")
 
@@ -513,12 +515,44 @@ def get_lr(it):
 # optimize!
 optimizer = raw_model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device_type=device_type)
 
+# 恢复优化器状态
+if resume_checkpoint is not None and 'optimizer' in resume_checkpoint:
+    optimizer.load_state_dict(resume_checkpoint['optimizer'])
+    if master_process:
+        print(f"✓ 恢复优化器状态")
+
 # create the log directory we will write checkpoints to and log to
 log_dir = "log"
 os.makedirs(log_dir, exist_ok=True)
 log_file = os.path.join(log_dir, f"log.txt")
-with open(log_file, "w") as f: # open for writing to clear the file
-    pass
+# 只有在非恢复模式下才清空日志文件，恢复训练时保留之前的日志
+if not args.resume:
+    with open(log_file, "w") as f: # open for writing to clear the file
+        pass
+
+# 恢复数据加载器状态
+if resume_checkpoint is not None and 'train_loader_state' in resume_checkpoint:
+    train_loader.current_shard = resume_checkpoint['train_loader_state']['current_shard']
+    train_loader.current_position = resume_checkpoint['train_loader_state']['current_position']
+    train_loader.tokens = load_tokens(train_loader.shards[train_loader.current_shard])
+    if master_process:
+        print(f"✓ 恢复数据加载器状态: shard {train_loader.current_shard}, position {train_loader.current_position}")
+
+# 截断日志文件，删除 >= start_step 的行，保证日志连续性
+if resume_checkpoint is not None and master_process:
+    if os.path.exists(log_file):
+        with open(log_file, "r") as f:
+            lines = f.readlines()
+        with open(log_file, "w") as f:
+            for line in lines:
+                try:
+                    step_in_line = int(line.split()[0])
+                    if step_in_line < start_step:
+                        f.write(line)
+                except (ValueError, IndexError):
+                    # 保留无法解析的行（如果有）
+                    f.write(line)
+        print(f"✓ 日志文件已截断至第 {start_step} 步之前")
 
 for step in range(start_step, max_steps):
     t0 = time.time()
@@ -544,17 +578,20 @@ for step in range(start_step, max_steps):
             print(f"validation loss: {val_loss_accum.item():.4f}")
             with open(log_file, "a") as f:
                 f.write(f"{step} val {val_loss_accum.item():.4f}\n")
-            if step > 0 and (step % 5000 == 0 or last_step):
+            if step > 0 and (step % 250 == 0 or last_step):
                 # optionally write model checkpoints
                 checkpoint_path = os.path.join(log_dir, f"model_{step:05d}.pt")
                 checkpoint = {
                     'model': raw_model.state_dict(),
                     'config': raw_model.config,
                     'step': step,
-                    'val_loss': val_loss_accum.item()
+                    'val_loss': val_loss_accum.item(),
+                    'optimizer': optimizer.state_dict(),
+                    'train_loader_state': {
+                        'current_shard': train_loader.current_shard,
+                        'current_position': train_loader.current_position,
+                    }
                 }
-                # you might also want to add optimizer.state_dict() and
-                # rng seeds etc., if you wanted to more exactly resume training
                 torch.save(checkpoint, checkpoint_path)
 
     # once in a while evaluate hellaswag

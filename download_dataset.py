@@ -7,13 +7,16 @@ import numpy as np
 from huggingface_hub import hf_hub_download, list_repo_files
 from tqdm import tqdm
 
-def download_edu_fineweb(download_all=False):
+def download_edu_fineweb(download_all=False, num_files=10, start_index=None, end_index=None):
     """
     下载 MLZoo/edu-fineweb-10B 数据集
     这是一个教育质量的 FineWeb 数据集，包含10B tokens，存储为 .npy 文件
     
     参数:
         download_all: 是否下载全部文件（默认 False）
+        num_files: 当 download_all=False 且未指定范围时，下载的文件数量（默认 10）
+        start_index: 起始文件索引（从1开始计数，如30表示第30个文件）
+        end_index: 结束文件索引（包含此索引，如50表示第50个文件）
     """
     print("=" * 60)
     print("开始下载 MLZoo/edu-fineweb-10B 数据集")
@@ -37,7 +40,18 @@ def download_edu_fineweb(download_all=False):
         print(f"✓ 找到 {len(npy_files)} 个 .npy 文件")
         
         # 确定要下载的文件
-        files_to_download = npy_files
+        if download_all:
+            files_to_download = npy_files
+            print(f"将下载全部 {len(files_to_download)} 个文件")
+        elif start_index is not None and end_index is not None:
+            # 使用指定的范围（索引从1开始，转换为从0开始）
+            start = start_index - 1
+            end = end_index
+            files_to_download = npy_files[start:end]
+            print(f"将下载第 {start_index} 到第 {end_index} 个文件（共 {len(files_to_download)} 个）")
+        else:
+            files_to_download = npy_files[:num_files]
+            print(f"将下载前 {len(files_to_download)} 个文件")
         
         print("\n开始下载文件...")
         downloaded_files = []
@@ -94,9 +108,11 @@ def download_edu_fineweb(download_all=False):
         return None
 
 if __name__ == "__main__":
-    # 默认下载前 5 个文件
+    # 默认下载前 10 个文件
     # 如需下载全部，请使用: download_edu_fineweb(download_all=True)
-    downloaded_files = download_edu_fineweb(download_all=False)
+    # 如需下载指定数量，请使用: download_edu_fineweb(download_all=False, num_files=20)
+    # 如需下载指定范围，请使用: download_edu_fineweb(start_index=31, end_index=50)
+    downloaded_files = download_edu_fineweb(start_index=76, end_index=100)
     
     if downloaded_files:
         print("\n✓ 数据集准备完成！可以开始训练了。")
